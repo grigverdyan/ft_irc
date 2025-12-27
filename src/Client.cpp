@@ -1,25 +1,30 @@
 #include "Client.hpp"
-#include <iostream>
 #include <sys/socket.h>
-#include <fstream>
+#include <errno.h>
 
 Client::Client(int fd, std::string &ip, std::string &hostname) 
     : fd_(fd)
     , ip_(ip)
-    , hostname_(hostname)
     , state_(UNAUTHENTICATED)
     , channelCount_(0)
+    , hasPassed_(false)
+    , hostname_(hostname)
+    , recvBuffer_()
+    , sendBuffer_()
 {}
 
 Client::Client(const Client& other) 
     : fd_(other.fd_)
     , ip_(other.ip_)
-    , hostname_(other.hostname_)
     , state_(other.state_)
+    , channelCount_(other.channelCount_)
+    , hasPassed_(other.hasPassed_)
+    , hostname_(other.hostname_)
     , username_(other.username_)
     , realname_(other.realname_)
     , nickname_(other.nickname_)
-    , channelCount_(other.channelCount_)
+    , recvBuffer_(other.recvBuffer_)
+    , sendBuffer_(other.sendBuffer_)
 {}
 
 Client::~Client()
@@ -42,21 +47,58 @@ Client &Client::operator=(const Client &rhs)
 	return *this;
 }
 
-void Client::write(const std::string& msg) const
+void Client::queue(const std::string& line)
 {
-    std::string buffer = msg + "\r\n";
-	if (send(fd_, buffer.c_str(), buffer.size(), 0) < 0) 
+    sendBuffer_ += line;
+    sendBuffer_ += "\r\n";
+}
+
+bool Client::hasPendingSend() const
+{
+    return !sendBuffer_.empty();
+}
+
+bool Client::flushSend()
+{
+    while (!sendBuffer_.empty())
     {
-		throw std::runtime_error("Failed to send message to client");
+        ssize_t n = ::send(fd_, sendBuffer_.c_str(), sendBuffer_.size(), 0);
+        if (n > 0)
+        {
+            sendBuffer_.erase(0, static_cast<size_t>(n));
+            continue;
+        }
+        if (n == 0)
+            return false;
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            return true;
+        return false;
     }
+    return true;
+}
+
+void Client::appendRecv(const std::string& data)
+{
+    recvBuffer_ += data;
+}
+
+bool Client::popLine(std::string& outLine)
+{
+    std::string::size_type pos = recvBuffer_.find("\n");
+    if (pos == std::string::npos)
+        return false;
+    outLine = recvBuffer_.substr(0, pos);
+    recvBuffer_.erase(0, pos + 1);
+    if (!outLine.empty() && outLine[outLine.size() - 1] == '\r')
+        outLine.erase(outLine.size() - 1);
+    return true;
 }
 
 std::string Client::getPrefix() const
 {
-	std::string username_ = username_.empty() ? "" : "!" + username_;
-	std::string hostname_ = hostname_.empty() ? "" : "@" + hostname_;
-
-	return nickname_ + username + hostname;
+    std::string u = username_.empty() ? "" : "!" + username_;
+    std::string h = hostname_.empty() ? "" : "@" + hostname_;
+    return nickname_ + u + h;
 }
 
 void Client::setNickname(const std::string& nickname) 
@@ -66,7 +108,10 @@ void Client::setNickname(const std::string& nickname)
     if (std::string::npos != nickname.find_first_of(" ,*?!@.")) {
         throw std::runtime_error("Nickname should not contain none of these chacarcters: \" ,*?!@.\"");
     }
-    if (nickname[0] == '$' || nickname[0] == ':') {
+        if (nickname.empty()) {
+		throw std::runtime_error("Nickname cannot be empty");
+	}
+        if (nickname[0] == '$' || nickname[0] == ':') {
         throw std::runtime_error("Nickname should not start with: $ or :");
     }
     nickname_ = nickname; 
